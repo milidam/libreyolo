@@ -898,7 +898,7 @@ def test_tflite_int8_export_defaults_to_single_pass(monkeypatch, tmp_path):
         "saved_model": 1,
         "convert": 1,
         "subprocess": 0,
-        "kwargs": {"output_dtype": "float32"},
+        "kwargs": {"output_dtype": "float32", "per_channel": True},
     }
     sidecar = json.loads(Path(str(dst) + ".json").read_text())
     assert sidecar["precision"] == "int8"
@@ -958,11 +958,13 @@ def test_tflite_exporter_forwards_int8_calibration_options(monkeypatch, tmp_path
         int8=True,
         data="coco8.yaml",
         int8_output_dtype="float32",
+        int8_per_channel=False,
     )
 
     assert captured["tflite"]["int8"] is True
     assert captured["tflite"]["int8_backend"] == "converter"
     assert captured["tflite"]["int8_output_dtype"] == "float32"
+    assert captured["tflite"]["int8_per_channel"] is False
 
 
 def test_tflite_int8_onnx2tf_backend_rejects_float32_output_dtype(tmp_path):
@@ -1086,11 +1088,35 @@ def test_convert_saved_model_int8_converts_once(
     ]
     assert converter.inference_input_type == "tf.int8"
     assert converter.inference_output_type == expected
+    # Per-channel by default: the converter flag disables it when True.
     assert converter._experimental_disable_per_channel is False
     # Representative dataset: the loader's NCHW images, as NHWC batch-1 samples.
     samples = list(converter.representative_dataset())
     assert [sample[0].shape for sample in samples] == [(1, 2, 2, 3)] * 2
     assert output_path.read_bytes() == b"quantized-model"
+
+
+@pytest.mark.parametrize(
+    ("per_channel", "disable_flag"),
+    [(True, False), (False, True)],
+)
+def test_convert_saved_model_int8_per_channel_toggle(
+    monkeypatch, tmp_path, per_channel, disable_flag
+):
+    from libreyolo.export import tflite as tflite_module
+
+    created = _fake_tensorflow(monkeypatch)
+    saved_model_dir = tmp_path / "saved_model"
+    saved_model_dir.mkdir()
+
+    tflite_module._convert_saved_model_int8(
+        saved_model_dir,
+        tmp_path / "model.tflite",
+        _FakeCalibration([_constant_images(1.0)], 1),
+        per_channel=per_channel,
+    )
+
+    assert created["converter"]._experimental_disable_per_channel is disable_flag
 
 
 def test_convert_saved_model_int8_rejects_unknown_output_dtype(monkeypatch, tmp_path):

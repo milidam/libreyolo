@@ -941,6 +941,7 @@ def _convert_saved_model_int8(
     calibration_data: Any,
     *,
     output_dtype: str = "int8",
+    per_channel: bool = True,
 ) -> None:
     """Quantize a SavedModel once, in process, and write the .tflite file."""
     import tensorflow as tf
@@ -963,7 +964,7 @@ def _convert_saved_model_int8(
     converter.inference_output_type = (
         tf.int8 if output_dtype == "int8" else tf.float32
     )
-    converter._experimental_disable_per_channel = False
+    converter._experimental_disable_per_channel = not per_channel
 
     output_path.write_bytes(converter.convert())
 
@@ -974,6 +975,7 @@ def _export_tflite_int8_single_pass(
     calibration_data: Any,
     *,
     output_dtype: str,
+    per_channel: bool,
     verbose: bool,
 ) -> str:
     logger.info("Converting ONNX to TFLite (single INT8 pass): %s", onnx_path)
@@ -985,6 +987,7 @@ def _export_tflite_int8_single_pass(
             output_path,
             calibration_data,
             output_dtype=output_dtype,
+            per_channel=per_channel,
         )
     logger.info("TFLite INT8 export complete: %s", output_path)
     return str(output_path)
@@ -1002,6 +1005,7 @@ def export_tflite(
     metadata: dict | None = None,
     int8_backend: str = "converter",
     int8_output_dtype: str = "int8",
+    int8_per_channel: bool = True,
 ) -> str:
     """Convert a static ONNX model to TensorFlow Lite using onnx2tf.
 
@@ -1082,6 +1086,7 @@ def export_tflite(
             dst,
             calibration_data,
             output_dtype=int8_output_dtype,
+            per_channel=int8_per_channel,
             verbose=verbose,
         )
         if metadata is not None:
