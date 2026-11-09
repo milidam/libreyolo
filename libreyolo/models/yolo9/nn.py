@@ -112,6 +112,14 @@ class Pool(nn.Module):
         return self.pool(x)
 
 
+def _fold_conv_bn(conv: Conv) -> Tuple[Tensor, Tensor]:
+    """Return the ``(weight, bias)`` of ``bn(conv(x))`` as one convolution."""
+    scale = conv.bn.weight / torch.sqrt(conv.bn.running_var + conv.bn.eps)
+    weight = conv.conv.weight * scale.reshape(-1, 1, 1, 1)
+    bias = conv.bn.bias - conv.bn.running_mean * scale
+    return weight.detach(), bias.detach()
+
+
 class RepConv(nn.Module):
     """Parallel kxk and 1x1 convolutions (no activation) summed, then activated."""
 
@@ -128,9 +136,70 @@ class RepConv(nn.Module):
         self.act = create_activation_function(activation)
         self.conv1 = Conv(in_channels, out_channels, kernel_size, activation=False, **kwargs)
         self.conv2 = Conv(in_channels, out_channels, 1, activation=False, **kwargs)
+        self._deployed = False
 
     def forward(self, x: Tensor) -> Tensor:
+        if self._deployed:
+            return self.act(self.conv(x))
         return self.act(self.conv1(x) + self.conv2(x))
+
+    def convert_to_deploy(self) -> RepConv:
+        """Merge both branches into a single kxk convolution, in place.
+
+        Folds each branch's batch norm into its kernel, pads the 1x1 kernel
+        into the centre of the kxk one and adds them, so ``forward`` runs one
+        convolution instead of two plus an add. Numerically equivalent; the
+        deployed tree no longer matches the training state dict, so call it on
+        an export copy. Idempotent.
+        """
+        if self._deployed:
+            return self
+
+        weight_a, bias_a = _fold_conv_bn(self.conv1)
+        weight_b, bias_b = _fold_conv_bn(self.conv2)
+
+        kernel_size = tuple(weight_a.shape[2:])
+        if kernel_size[0] % 2 == 0 or kernel_size[1] % 2 == 0:
+            raise ValueError(
+                f"RepConv reparameterization needs an odd kernel, got {kernel_size}."
+            )
+        if tuple(weight_b.shape[2:]) != (1, 1):
+            raise ValueError(
+                f"RepConv's second branch must be 1x1, got {weight_b.shape[2:]}."
+            )
+        if weight_a.shape[:2] != weight_b.shape[:2]:
+            raise ValueError(
+                "RepConv branches disagree on channel counts: "
+                f"{tuple(weight_a.shape[:2])} vs {tuple(weight_b.shape[:2])}."
+            )
+
+        merged = torch.zeros_like(weight_a)
+        top = (kernel_size[0] - 1) // 2
+        left = (kernel_size[1] - 1) // 2
+        merged[:, :, top:top + 1, left:left + 1] = weight_b
+
+        source = self.conv1.conv
+        conv = nn.Conv2d(
+            source.in_channels,
+            source.out_channels,
+            kernel_size=kernel_size,
+            stride=source.stride,
+            padding=source.padding,
+            dilation=source.dilation,
+            groups=source.groups,
+            bias=True,
+            device=source.weight.device,
+            dtype=source.weight.dtype,
+        )
+        with torch.no_grad():
+            conv.weight.copy_(weight_a + merged)
+            conv.bias.copy_(bias_a + bias_b)
+
+        self.conv = conv
+        self.conv1 = None
+        self.conv2 = None
+        self._deployed = True
+        return self
 
 
 class Bottleneck(nn.Module):
@@ -1227,6 +1296,18 @@ class LibreYOLO9Model(nn.Module):
             if key in main and key in aux:
                 combined[key] = main[key] + self.aux_weight * aux[key]
         return combined
+
+    def deploy(self) -> LibreYOLO9Model:
+        """Fold batch norm and merge every :class:`RepConv` branch for export.
+
+        Rewrites the module tree, so the result no longer loads the training
+        state dict. Export paths call it on a deep copy.
+        """
+        self.eval()
+        for module in self.modules():
+            if module is not self and hasattr(module, "convert_to_deploy"):
+                module.convert_to_deploy()
+        return self
 
     def forward(self, x, targets=None):
         """

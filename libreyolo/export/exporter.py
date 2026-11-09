@@ -1245,6 +1245,14 @@ class BaseExporter(ABC):
             ).to(device)
             nn_model.eval()
             dfine_wrapped = True  # share the YOLOX-head-export skip path below
+        elif family in {"yolo9", "yolo9_p2", "yolo9_e2e"}:
+            # RepConv keeps a parallel 1x1 branch and an add in the graph. Fold
+            # both branches into the kxk convolution: exact, and it removes one
+            # convolution and one elementwise pass per block on every runtime.
+            # deploy() rewrites the module tree, so keep the caller's model.
+            nn_model = copy.deepcopy(nn_model)
+            nn_model.deploy()
+            nn_model.eval()
         elif family in {"yolo1", "yolo2", "yolo3", "yolo4"}:
             from ..models.darknet.export import DarknetExportWrapper
 
