@@ -298,6 +298,10 @@ def export_onnx(
         and not is_edge
         and not is_semantic
         and not is_gaze
+        # YOLO9 is detection-only. Its exports can legitimately have more than
+        # two outputs (the raw per-level head emits six), so the output count
+        # must not be read as a segmentation task.
+        and model_family != "yolo9"
         # Supersedes the narrower is_hrnet_pose guard: every pose family has
         # its own output-name branch below, and probing here would misread a
         # multi-tensor pose head (rfdetr-pose 3, yolonas-pose 4) as

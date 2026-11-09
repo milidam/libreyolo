@@ -64,6 +64,12 @@ TFLITE_INT8_EXPORTS = INT8_EXPORTS["tflite"]
 # scale; TFLiteBackend rescales the boxes and rebuilds the family layout.
 SPLIT_OUTPUT_LAYOUT = "boxes_norm_scores"
 
+# Sidecar ``output_layout`` value for ``decode="host"``: the graph ends at the
+# per-level head tensors instead of decoding inside INT8. The sidecar carries
+# ``reg_max`` and a ``levels`` list (stride, height, width); the runtime applies
+# the DFL, the box arithmetic and the class sigmoid.
+RAW_OUTPUT_LAYOUT = "raw_levels"
+
 
 def check_tflite_int8_available() -> None:
     """Check the TensorFlow converter that TFLite INT8 export runs through."""
@@ -1165,6 +1171,7 @@ def export_tflite(
 
 
 __all__ = [
+    "RAW_OUTPUT_LAYOUT",
     "SPLIT_OUTPUT_LAYOUT",
     "TFLITE_INT8_EXPORTS",
     "check_tflite_export_available",

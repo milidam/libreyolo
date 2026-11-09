@@ -360,8 +360,8 @@ class _YOLONASExportWrapper(torch.nn.Module):
 _INT8_LOGIT_BOUND = 8.0
 
 
-def _bounded_sigmoid(conv: torch.nn.Conv2d, x: torch.Tensor) -> torch.Tensor:
-    """``sigmoid(conv(x))`` with the logits bounded inside the conv output.
+def _bounded_logits(conv: torch.nn.Conv2d, x: torch.Tensor) -> torch.Tensor:
+    """``conv(x)`` rescaled so ``[-B, B]`` maps onto ``[0, 6]`` and clamped there.
 
     Full-integer quantization gives the conv output one int8 scale over its
     calibrated range. Background logits reach about -380 on YOLO9, which
@@ -381,7 +381,12 @@ def _bounded_sigmoid(conv: torch.nn.Conv2d, x: torch.Tensor) -> torch.Tensor:
         conv.dilation,
         conv.groups,
     )
-    return (z.clamp(0.0, 6.0) / k - bound).sigmoid()
+    return z.clamp(0.0, 6.0) / k - bound
+
+
+def _bounded_sigmoid(conv: torch.nn.Conv2d, x: torch.Tensor) -> torch.Tensor:
+    """``sigmoid(conv(x))`` with the logits bounded inside the conv output."""
+    return _bounded_logits(conv, x).sigmoid()
 
 
 class _YOLOXSplitOutputWrapper(torch.nn.Module):
@@ -487,6 +492,36 @@ class _YOLO9SplitOutputWrapper(torch.nn.Module):
                 .permute(0, 2, 1)
             )
         return torch.cat(boxes, 2), torch.cat(scores, 1)
+
+
+class _YOLO9RawOutputWrapper(torch.nn.Module):
+    """YOLO9 graph ending at the raw per-level head tensors.
+
+    Each level emits the box-tower logits ``(B, 4 * reg_max, H, W)`` and the
+    bounded class logits ``(B, nc, H, W)``. The DFL softmax/expectation, the
+    box arithmetic and the cross-level concatenation then run on the host, so
+    the quantized graph has no decode tail and every stride keeps its own int8
+    scale. The host applies ``sigmoid`` to the class logits.
+
+    The output order is ``box_0, cls_0, box_1, cls_1, ...``; the sidecar
+    records the levels so a runtime can pair the tensors by shape.
+    """
+
+    def __init__(self, model: torch.nn.Module, canvas_hw: tuple[int, int]):
+        super().__init__()
+        self.model = model
+        self.canvas_h, self.canvas_w = (int(v) for v in canvas_hw)
+
+    def forward(self, x):
+        feats = self.model.neck(*self.model.backbone(x))
+        head = self.model.head
+        outputs = []
+        for feat, anchor_conv, class_conv in zip(
+            feats, head.anchor_convs, head.class_convs
+        ):
+            outputs.append(anchor_conv(feat))
+            outputs.append(_bounded_logits(class_conv[-1], class_conv[:-1](feat)))
+        return tuple(outputs)
 
 
 # =============================================================================
@@ -2668,6 +2703,9 @@ class TFLiteExporter(BaseExporter):
     # Like ONNX INT8 and the YOLO export convention, int8=True without data=
     # calibrates on the default dataset and warns that it is not representative.
     default_int8_calibration_data = True
+    # ``decode`` selects whether the detection decode stays in the graph
+    # ("graph", default) or is left to the host ("host", YOLO9 INT8 only).
+    _extra_export_kwargs = frozenset({"nms", "deepstream", "decode"})
 
     def __call__(self, *args, dynamic: bool = False, **kwargs) -> str:
         if dynamic:
@@ -2701,6 +2739,26 @@ class TFLiteExporter(BaseExporter):
         family = self.model._get_model_name()
         task = getattr(self.model, "task", "detect")
         self._split_outputs = False
+        self._raw_outputs = False
+
+        decode = kwargs.get("decode", "graph")
+        if decode not in {"graph", "host"}:
+            raise ValueError(
+                f"decode must be 'graph' or 'host', got {decode!r}."
+            )
+        if decode == "host":
+            if not kwargs.get("int8"):
+                raise ValueError(
+                    "decode='host' is only available for int8=True; the float "
+                    "graph already runs its decode on the host runtime."
+                )
+            if family != "yolo9":
+                raise NotImplementedError(
+                    "decode='host' currently supports the yolo9 family only; "
+                    f"got {family!r}."
+                )
+            self._raw_outputs = True
+
         if kwargs.get("int8"):
             if (family, task) not in TFLITE_INT8_EXPORTS:
                 supported = ", ".join(f"{f} {t}" for f, t in sorted(TFLITE_INT8_EXPORTS))
@@ -2708,7 +2766,7 @@ class TFLiteExporter(BaseExporter):
                     f"TFLite INT8 export currently supports: {supported}. "
                     f"Got model family {family!r}, task {task!r}."
                 )
-            self._split_outputs = True
+            self._split_outputs = not self._raw_outputs
         super()._preflight(**kwargs)
         check_tflite_export_available()
         check_tflite_converter_version(family, task)
@@ -2718,7 +2776,11 @@ class TFLiteExporter(BaseExporter):
     def _export_intermediate_onnx(
         self, nn_model, dummy, output_path, opset, simplify, dynamic
     ):
-        if getattr(self, "_split_outputs", False):
+        if getattr(self, "_raw_outputs", False):
+            nn_model = _YOLO9RawOutputWrapper(
+                nn_model, dummy.shape[-2:]
+            ).eval()
+        elif getattr(self, "_split_outputs", False):
             wrapper = {
                 "yolox": _YOLOXSplitOutputWrapper,
                 "yolo9": _YOLO9SplitOutputWrapper,
@@ -2729,10 +2791,25 @@ class TFLiteExporter(BaseExporter):
         )
 
     def _build_metadata(self, precision, dynamic, onnx_path, imgsz=None):
-        from .tflite import SPLIT_OUTPUT_LAYOUT
+        from .tflite import RAW_OUTPUT_LAYOUT, SPLIT_OUTPUT_LAYOUT
 
         meta = super()._build_metadata(precision, dynamic, onnx_path, imgsz=imgsz)
-        if getattr(self, "_split_outputs", False):
+        if getattr(self, "_raw_outputs", False):
+            head = getattr(self.model.model, "head", None)
+            strides = tuple(getattr(head, "strides", (8, 16, 32)))
+            height = int(meta["imgsz_h"])
+            width = int(meta["imgsz_w"])
+            meta["output_layout"] = RAW_OUTPUT_LAYOUT
+            meta["reg_max"] = int(getattr(head, "reg_max", 16))
+            meta["levels"] = [
+                {
+                    "stride": int(stride),
+                    "height": height // int(stride),
+                    "width": width // int(stride),
+                }
+                for stride in strides
+            ]
+        elif getattr(self, "_split_outputs", False):
             meta["output_layout"] = SPLIT_OUTPUT_LAYOUT
         return meta
 

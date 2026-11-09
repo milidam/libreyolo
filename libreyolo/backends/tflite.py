@@ -15,9 +15,11 @@ from .base import BaseBackend, _read_metadata_imgsz, _read_pose_metadata, classi
 
 logger = logging.getLogger(__name__)
 
-# Must match ``libreyolo.export.tflite.SPLIT_OUTPUT_LAYOUT``; kept here so the
-# runtime does not import the (torch-based) export package.
+# Must match ``libreyolo.export.tflite.SPLIT_OUTPUT_LAYOUT`` and
+# ``RAW_OUTPUT_LAYOUT``; kept here so the runtime does not import the
+# (torch-based) export package.
 SPLIT_OUTPUT_LAYOUT = "boxes_norm_scores"
+RAW_OUTPUT_LAYOUT = "raw_levels"
 
 
 class TFLiteBackend(BaseBackend):
@@ -87,6 +89,8 @@ class TFLiteBackend(BaseBackend):
         )
 
         self._output_layout = metadata.get("output_layout")
+        self._raw_levels = metadata.get("levels") or []
+        self._reg_max = int(metadata.get("reg_max", 16))
         self._canvas_hw = (
             int(metadata.get("imgsz_h") or imgsz),
             int(metadata.get("imgsz_w") or imgsz),
@@ -189,6 +193,8 @@ class TFLiteBackend(BaseBackend):
             outputs.append(np.ascontiguousarray(output))
         if getattr(self, "_output_layout", None) == SPLIT_OUTPUT_LAYOUT:
             return [self._merge_split_outputs(outputs)]
+        if getattr(self, "_output_layout", None) == RAW_OUTPUT_LAYOUT:
+            return [self._decode_raw_outputs(outputs)]
         return outputs
 
     def _merge_split_outputs(self, outputs: list) -> np.ndarray:
@@ -219,6 +225,69 @@ class TFLiteBackend(BaseBackend):
             # YOLO9 parsing expects the channel-first (B, 4 + nc, N) layout.
             merged = np.transpose(merged, (0, 2, 1))
         return np.ascontiguousarray(merged)
+
+    def _decode_raw_outputs(self, outputs: list) -> np.ndarray:
+        """Rebuild the family tensor from per-level raw head outputs.
+
+        A ``decode="host"`` export ends at the box and class towers: each
+        level contributes one box-logit tensor and one class-logit tensor. The
+        sidecar ``levels`` list fixes the grids, so the tensors are paired by
+        shape rather than by output order.
+        """
+        from ..postprocess.yolo9 import decode_raw_levels
+
+        levels = self._raw_levels
+        if not levels:
+            raise ValueError(
+                f"Output layout {RAW_OUTPUT_LAYOUT!r} needs 'levels' in the "
+                "TFLite metadata."
+            )
+
+        used = set()
+        box_tensors, class_tensors = [], []
+        for level in levels:
+            height = int(level["height"])
+            width = int(level["width"])
+            box_index = self._find_raw_output(
+                outputs, used, height, width, 4 * self._reg_max
+            )
+            used.add(box_index)
+            class_index = self._find_raw_output(
+                outputs, used, height, width, self.nb_classes
+            )
+            used.add(class_index)
+            box_tensors.append(outputs[box_index])
+            class_tensors.append(outputs[class_index])
+
+        return decode_raw_levels(
+            box_tensors,
+            class_tensors,
+            levels,
+            self._canvas_hw,
+            reg_max=self._reg_max,
+        )
+
+    @staticmethod
+    def _find_raw_output(outputs, used, height, width, channels):
+        """Index of the unused raw output with this grid and channel count."""
+        for index, value in enumerate(outputs):
+            if index in used or value.ndim != 4:
+                continue
+            if (
+                value.shape[-1] == channels
+                and tuple(value.shape[1:3]) == (height, width)
+            ):
+                return index
+            if (
+                value.shape[1] == channels
+                and tuple(value.shape[2:4]) == (height, width)
+            ):
+                return index
+        raise ValueError(
+            "No raw head output matches "
+            f"{height}x{width} with {channels} channels; got "
+            f"{[tuple(value.shape) for value in outputs]}."
+        )
 
 
 __all__ = ["TFLiteBackend"]

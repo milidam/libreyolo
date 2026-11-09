@@ -9,7 +9,9 @@ from __future__ import annotations
 from . import obb_ops
 from ..utils.lazy import lazy_module
 
-from typing import Dict, Tuple, Union
+from typing import Dict, Sequence, Tuple, Union
+
+import numpy as np
 
 
 # torch is resolved on first use so this module stays importable in a
@@ -386,3 +388,94 @@ def postprocess(
         result["keypoints"] = keypoints_out.detach().cpu()
 
     return result
+
+
+def decode_raw_levels(
+    box_logits: Sequence[np.ndarray],
+    class_logits: Sequence[np.ndarray],
+    levels: Sequence[dict],
+    canvas_hw: Tuple[int, int],
+    reg_max: int = 16,
+) -> np.ndarray:
+    """Decode raw per-level head tensors into ``(B, 4 + nc, N)``.
+
+    This is the host-side counterpart of the graph decode: ``box_logits`` and
+    ``class_logits`` are the per-level tensors a ``decode="host"`` export emits
+    (NHWC, or NCHW and transposed here), ``levels`` carries each level's stride
+    and the canvas is ``(height, width)``. The result matches the layout the
+    graph-decoding exports produce, so the shared postprocess consumes it
+    unchanged.
+
+    Boxes are xyxy normalized to the canvas and scores are sigmoid class
+    probabilities.
+    """
+    if not (len(box_logits) == len(class_logits) == len(levels)):
+        raise ValueError(
+            "decode_raw_levels needs one box tensor, one class tensor and one "
+            f"level per stride; got {len(box_logits)}/{len(class_logits)}/"
+            f"{len(levels)}."
+        )
+
+    canvas_h, canvas_w = (float(value) for value in canvas_hw)
+    bins = np.arange(reg_max, dtype=np.float32)
+    boxes_out, scores_out = [], []
+
+    for box, cls, level in zip(box_logits, class_logits, levels):
+        box = np.asarray(box, dtype=np.float32)
+        cls = np.asarray(cls, dtype=np.float32)
+        if box.ndim != 4 or cls.ndim != 4:
+            raise ValueError(
+                "decode_raw_levels expects rank-4 box and class tensors; got "
+                f"{box.shape} and {cls.shape}."
+            )
+
+        if box.shape[-1] != 4 * reg_max:
+            box = np.moveaxis(box, 1, -1)
+        if box.shape[-1] != 4 * reg_max:
+            raise ValueError(
+                f"Box tensor has {box.shape[-1]} channels, expected "
+                f"{4 * reg_max}."
+            )
+        if cls.shape[:3] != box.shape[:3]:
+            cls = np.moveaxis(cls, 1, -1)
+        if cls.shape[:3] != box.shape[:3]:
+            raise ValueError(
+                f"Box and class tensors disagree on the spatial grid: "
+                f"{box.shape} vs {cls.shape}."
+            )
+
+        batch, height, width, _ = box.shape
+        logits = box.reshape(batch, height, width, 4, reg_max)
+        logits = logits - logits.max(axis=-1, keepdims=True)
+        probabilities = np.exp(logits)
+        probabilities /= probabilities.sum(axis=-1, keepdims=True)
+        distances = (probabilities * bins).sum(axis=-1)  # (B, H, W, 4)
+
+        stride = float(level["stride"])
+        grid_x = np.arange(width, dtype=np.float32) + 0.5
+        grid_y = np.arange(height, dtype=np.float32) + 0.5
+        xs, ys = np.meshgrid(grid_x, grid_y)
+        boxes = np.stack(
+            [
+                (xs - distances[..., 0]) * stride / canvas_w,
+                (ys - distances[..., 1]) * stride / canvas_h,
+                (xs + distances[..., 2]) * stride / canvas_w,
+                (ys + distances[..., 3]) * stride / canvas_h,
+            ],
+            axis=-1,
+        ).reshape(batch, height * width, 4)
+        scores = (1.0 / (1.0 + np.exp(-cls))).reshape(
+            batch, height * width, cls.shape[-1]
+        )
+
+        boxes_out.append(np.transpose(boxes, (0, 2, 1)))
+        scores_out.append(scores)
+
+    merged = np.concatenate(
+        [
+            np.concatenate(boxes_out, axis=2),
+            np.concatenate(scores_out, axis=1).transpose(0, 2, 1),
+        ],
+        axis=1,
+    )
+    return np.ascontiguousarray(merged)
